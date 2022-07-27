@@ -1,26 +1,418 @@
-# Use the latest 2.1 version of CircleCI pipeline process engine.
-# See: https://circleci.com/docs/2.0/configuration-reference
 version: 2.1
-
-# Define a job to be invoked later in a workflow.
-# See: https://circleci.com/docs/2.0/configuration-reference/#jobs
+orbs:
+  salus: federacy/salus@3.0.0
 jobs:
-  say-hello:
-    # Specify the execution environment. You can specify an image from Dockerhub or use one of our Convenience Images from CircleCI's Developer Hub.
-    # See: https://circleci.com/docs/2.0/configuration-reference/#docker-machine-macos-windows-executor
+  lint:
     docker:
-      - image: cimg/base:stable
-    # Add steps to the job
-    # See: https://circleci.com/docs/2.0/configuration-reference/#steps
+      - image: golangci/golangci-lint:v1.44.2
+    environment:
+      TEST_RESULTS: /tmp/test-results
+      GOPRIVATE: github.com/bisontrails
+    steps:
+        - add_ssh_keys:
+            # ssh key is a deploy key added to allow build to access github.com/bisontrails/srvmock dependency
+            # as described in https://circleci.com/docs/2.0/add-ssh-key/#circleci-cloud-or-server-3-x
+            fingerprints:
+              - "0a:53:06:35:a6:97:ea:40:1a:97:73:7c:d2:db:ff:5f"
+        - checkout
+        - run: mkdir -p $TEST_RESULTS
+        - run:
+            name: Lint SDK
+            working_directory: sdk
+            command: |
+              golangci-lint run --out-format junit-xml | tee ${TEST_RESULTS}/golangci-lint-report.xml
+        - run:
+            name: Lint blockchain-proxy
+            working_directory: blockchain-proxy
+            command: |
+              golangci-lint run --out-format junit-xml | tee ${TEST_RESULTS}/golangci-lint-report.xml
+        - run:
+            name: Lint ethereumproxy
+            working_directory: ethereumproxy
+            command: |
+              golangci-lint run --out-format junit-xml | tee ${TEST_RESULTS}/golangci-lint-report.xml
+        - run:
+            name: Lint integration-tests
+            working_directory: test/integration
+            command: |
+              golangci-lint run --out-format junit-xml | tee ${TEST_RESULTS}/golangci-lint-report.xml
+        - run:
+            name: Lint performance-tests
+            working_directory: test/performance
+            command: |
+              golangci-lint run --out-format junit-xml | tee ${TEST_RESULTS}/golangci-lint-report.xml
+        - run:
+            name: Lint simulation-tests
+            working_directory: test/simulation
+            command: |
+              golangci-lint run --out-format junit-xml | tee ${TEST_RESULTS}/golangci-lint-report.xml
+        - run:
+            name: Lint latency-tests
+            working_directory: test/latency
+            command: |
+              golangci-lint run --out-format junit-xml | tee ${TEST_RESULTS}/golangci-lint-report.xml
+        - store_test_results:
+            path: /tmp/test-results
+
+  build:
+    environment:
+      GOPRIVATE: github.com/bisontrails
+    parameters:
+      project:
+        type: string
+        default: sdk
+      build_docker:
+        type: boolean
+        default: true
+      working_directory:
+        type: string
+        default: sdk
+    docker:
+      - image: cimg/go:1.17
+    steps:
+      - add_ssh_keys:
+          # ssh key is a deploy key added to allow build to access github.com/bisontrails/srvmock dependency
+          # as described in https://circleci.com/docs/2.0/add-ssh-key/#circleci-cloud-or-server-3-x
+          fingerprints:
+            - "0a:53:06:35:a6:97:ea:40:1a:97:73:7c:d2:db:ff:5f"
+      - checkout
+      - run:
+          name: Run unit tests
+          working_directory: <<parameters.working_directory>>
+          command: make test
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - when:
+          condition: <<parameters.build_docker>>
+          steps:
+            - run:
+                name: Build Docker image
+                working_directory: <<parameters.working_directory>>
+                command: |
+                  set -e
+
+                  if [ "${CIRCLE_BRANCH}" == "master" ]; then
+                    make docker
+                  else
+                    make -e DOCKER_TAG=$CIRCLE_SHA1 docker
+                  fi
+            - when:
+                condition:
+                  equal: [ master, << pipeline.git.branch >> ]
+                steps:
+                  - run:
+                      name: Publish Docker Image to Docker Hub
+                      working_directory:  <<parameters.working_directory>>
+                      command: |
+                        set -e
+                        echo "$DOCKERHUB_PASS" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+                        docker push bisontrails/<<parameters.project>>:$(cat VERSION)
+      - when:
+          condition:
+              and:
+                - equal: [ master, << pipeline.git.branch >> ]
+                - equal: [ true, <<parameters.build_docker>> ]
+          steps:
+            - run:
+                name: Build Builder Image to Docker Hub
+                working_directory:  <<parameters.working_directory>>
+                command: |
+                  set -e
+                  make docker DOCKER_ARGS="--target builder" DOCKER_TAG=builder
+            - run:
+                name: Publish Builder Image to Docker Hub
+                working_directory:  <<parameters.working_directory>>
+                command: |
+                  set -e
+
+                  echo "$DOCKERHUB_PASS" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+                  docker push bisontrails/<<parameters.project>>:builder
+  integration-tests:
+    environment:
+      GOPRIVATE: github.com/bisontrails
+    docker:
+      - image: bisontrails/blockchain-proxy:builder
+        auth:
+          username: $DOCKERHUB_USERNAME
+          password: $DOCKERHUB_PASS
+      - image: cimg/redis:6.2.6
     steps:
       - checkout
       - run:
-          name: "Say hello"
-          command: "echo Hello, World!"
+          # Spin up a mock go http server
+          name: Run HTTP Server
+          working_directory: test/fixtures
+          background: true
+          command: go run mock_http_server.go
+      - run:
+          # Spin up a mock go json-rpc server
+          name: Run JSON-RPC Server
+          working_directory: test/fixtures
+          background: true
+          command: go run mock_json_rpc_server.go
+      - run:
+          # Spin up a proxy instance
+          name: Run Proxy Server
+          working_directory: blockchain-proxy
+          background: true
+          command: go run main.go -c ../test/fixtures/integration-test-config.yaml
+      - run:
+          # Verify we can send http requests and receive block data
+          name: Http Integration Test
+          working_directory: test/integration
+          # curl --retry will poll an endpoint until it's available,
+          # with exponential backoffs each time starting at 1 sec.
+          # curl --retry 5 will have a max timeout of 31 seconds (1,2,4,8,16 second backoffs)
+          command: |
+            curl \
+              --retry 5 \
+              --retry-connrefused \
+              --connect-timeout 5 \
+              http://127.0.0.1:3000
 
-# Invoke jobs via workflows
-# See: https://circleci.com/docs/2.0/configuration-reference/#workflows
+            go test -tags=integration -v -count=1 http_test.go
+      - run:
+          # Verify we can perform remote multiplication calls
+          name: JSON-RPC Integration Test
+          working_directory: test/integration
+          command: |
+            curl \
+              --retry 5 \
+              --retry-connrefused \
+              --connect-timeout 5 \
+              http://127.0.0.1:3001
+
+            go test -tags=integration -v -count=1 rpc_test.go
+      - run:
+          # Run Redis integration tests from sdk
+          name: Redis Integration Test
+          working_directory: "sdk"
+          command: make test-integration-ci
+      - run:
+          name: Spin up a ethereum-proxy
+          working_directory: "ethereumproxy"
+          background: true
+          command: go run main.go -c ../test/fixtures/performance-test-jsonrpc-config.yaml
+          environment:
+            BLOCK_BY_NUMBER: true
+      - run:
+          name: Redis Performance Test
+          working_directory: "test/performance"
+          command: |
+            curl \
+              --retry 6 \
+              --retry-connrefused \
+              --connect-timeout 5 \
+              http://127.0.0.1:3002
+            go test -v -count=1 performance_test.go
+  simulation-tests:
+    docker:
+      - image: bisontrails/blockchain-proxy:builder
+        auth:
+          username: $DOCKERHUB_USERNAME
+          password: $DOCKERHUB_PASS
+    steps:
+      - run:
+          name: Start Generic Blockchain Proxy
+          background: true
+          working_directory: blockchain-proxy
+          command: go run main.go -c ../test/fixtures/simulation-test-jsonrpc-config.yaml
+      - run:
+          name: Simulation test
+          working_directory: test/simulation
+          command: |
+            paws run -c paws-config/eth-node.yaml --loglevel 1 --simulations query -p ethereum-node/
+            cat ethereum-node/ethereum/Statistics.txt
+            curl \
+              --retry 6 \
+              --retry-connrefused \
+              --connect-timeout 5 \
+              http://127.0.0.1:3003
+            paws run -c paws-config/eth-proxy.yaml --loglevel 1 --simulations query -p ethereum-proxy/
+            cat ethereum-proxy/ethereum/Statistics.txt
+            go test -v -count=1 simulation_test.go
+  integration-tests-docker-compose:
+    machine:
+      image: ubuntu-2004:202201-02
+    steps:
+      - checkout
+      - run:
+          name: cachectl Integration Test
+          working_directory: "tools/cachectl"
+          command: make test-integration-ci
+  latency-tests:
+    docker:
+      - image: bisontrails/ethereumproxy:builder
+        auth:
+          username: $DOCKERHUB_USERNAME
+          password: $DOCKERHUB_PASS
+      - image: cimg/redis:6.2.6
+    environment:
+      PROXY_ENV: local
+    steps:
+      - checkout
+      - run:
+          name: Build ethereumproxy
+          working_directory: ethereumproxy
+          command: |
+            make build
+            cp build/bin/ethereumproxy ../test/fixtures
+      - run:
+          # Spin up a mock upstream json-rpc server
+          name: Run JSON-RPC Server
+          working_directory: test/fixtures
+          background: true
+          command: go run mock_json_rpc_server.go
+      - run:
+          name: Check JSON-RPC Server alive
+          command: |
+            curl \
+              --retry 6 \
+              --retry-connrefused \
+              --connect-timeout 5 \
+              http://127.0.0.1:8091
+      - run:
+          name: "Run JSON-RPC Proxy: Basic"
+          working_directory: test/fixtures
+          background: true
+          command: ./ethereumproxy -c latency-test-jsonrpc-basic.yaml
+      - run:
+          name: "Run JSON-RPC Proxy: Allow-list"
+          working_directory: test/fixtures
+          background: true
+          command: ./ethereumproxy -c latency-test-jsonrpc-allowlist.yaml
+      - run:
+          name: "Run JSON-RPC Proxy: Cache"
+          working_directory: test/fixtures
+          background: true
+          command: ./ethereumproxy -c latency-test-jsonrpc-cache.yaml
+      - run:
+          name: "Run JSON-RPC Proxy: Cache Non Caching Method"
+          working_directory: test/fixtures
+          background: true
+          command: ./ethereumproxy -c latency-test-jsonrpc-cache-non-caching-method.yaml
+      - run:
+          name: "Run JSON-RPC Proxy: Metrics"
+          working_directory: test/fixtures
+          background: true
+          command: ./ethereumproxy -c latency-test-jsonrpc-basic-metrics.yaml --metrics --disable-response-time-metrics
+      - run:
+          name: "Run JSON-RPC Proxy: Metrics Upstream duration Enabled"
+          working_directory: test/fixtures
+          background: true
+          command: ./ethereumproxy -c latency-test-jsonrpc-basic-metrics-upstream-duration.yaml --metrics
+      - run:
+          name: "Run JSON-RPC Proxy: Tracing"
+          working_directory: test/fixtures
+          background: true
+          command: ./ethereumproxy -c latency-test-jsonrpc-basic-tracing.yaml --tracing
+      - run:
+          name: Run Latency test
+          working_directory: test/latency
+          command: |
+            curl \
+              --retry 6 \
+              --retry-connrefused \
+              --connect-timeout 5 \
+              http://127.0.0.1:3000
+            go test -v -timeout 10m latency_test.go
+
+
 workflows:
-  say-hello-workflow:
+  version: 2
+  build-workflow:
     jobs:
-      - say-hello
+      - lint
+      - build:
+          context:
+            - docker_hub
+          name: build sdk
+          project: 'sdk'
+          build_docker: false
+          working_directory: 'sdk'
+      - build:
+          context:
+            - docker_hub
+          name: build ethereumproxy
+          project: 'ethereumproxy'
+          working_directory: 'ethereumproxy'
+      - build:
+          context:
+            - docker_hub
+          name: build blockchain-proxy
+          project: 'blockchain-proxy'
+          working_directory: 'blockchain-proxy'
+      # Note: Publishing docker image for cachectl tool requires admin to enable pushing to new registry path. 
+      # Given that the cachectl tool isn't in active use nor in active development, commenting it out for now
+      # to remediate CI build failure. 
+      #- build:
+      #    context:
+      #      - docker_hub
+      #    name: build cachectl
+      #    project: 'cachectl'
+      #    working_directory: 'tools/cachectl'
+  integration-tests:
+    jobs:
+      - integration-tests:
+          context:
+            - docker_hub
+  latency-tests:
+    jobs:
+      - latency-tests:
+          context:
+            - docker_hub
+  scan:
+    jobs:
+      - salus/scan:
+          pre-steps:
+            - add_ssh_keys:
+                # ssh key is a deploy key added to allow build to access github.com/bisontrails/srvmock dependency
+                # as described in https://circleci.com/docs/2.0/add-ssh-key/#circleci-cloud-or-server-3-x
+                fingerprints:
+                  - "0a:53:06:35:a6:97:ea:40:1a:97:73:7c:d2:db:ff:5f"
+            - run:
+                name: install make, git, and ssh in order to fetch Go dependencies from private repos
+                command: apt update && apt install -y make git ssh
+            - checkout
+            - run:
+                name: vendor sdk
+                working_directory: sdk
+                command: git config --global url."git@github.com:".insteadOf "https://github.com/" && GOPRIVATE=github.com/bisontrails make vendor
+            - run:
+                name: vendor cachectl
+                working_directory: tools/cachectl
+                command: git config --global url."git@github.com:".insteadOf "https://github.com/" && GOPRIVATE=github.com/bisontrails make vendor
+            - run:
+                name: vendor ethereumproxy
+                working_directory: ethereumproxy
+                command: git config --global url."git@github.com:".insteadOf "https://github.com/" && GOPRIVATE=github.com/bisontrails make vendor
+            - run:
+                name: vendor blockchain-proxy
+                working_directory: blockchain-proxy
+                command: git config --global url."git@github.com:".insteadOf "https://github.com/" && GOPRIVATE=github.com/bisontrails make vendor
+          configuration_file: "salus-config.yml"
+  simulation-tests:
+    jobs:
+      - simulation-tests:
+          pre-steps:
+            - checkout
+            - add_ssh_keys:
+                # ssh key is a deploy key added to allow build to access github.com/bisontrails/paws dependency
+                # as described in https://circleci.com/docs/2.0/add-ssh-key/#circleci-cloud-or-server-3-x
+                fingerprints:
+                  - "e6:41:a9:79:f7:cc:4d:d7:c4:51:d6:bb:8f:74:5c:01"
+            - run:
+                name: install make, git, and ssh in order to fetch Go dependencies from private repos
+                command: apt update && apt install -y make git ssh
+            - run:
+                name: install paws
+                command: |
+                  git config --global url."git@github.com:".insteadOf "https://github.com/"
+                  go env
+                  GOPRIVATE=github.com/bisontrails go install github.com/bisontrails/paws@bfcfc35
+          context:
+            - docker_hub
+          filters:
+            branches:
+              only:
+                - master
